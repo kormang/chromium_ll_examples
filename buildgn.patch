@@ -1,0 +1,12 @@
+diff --git a/BUILD.gn b/BUILD.gn
+index 6dbe1005ae..2f16de6c3c 100644
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -87,6 +87,7 @@ group("gn_all") {
+     ":gn_visibility",
+     "//base:base_perftests",
+     "//base:base_unittests",
++    "//chromium_ll_examples",
+     "//codelabs",
+     "//components:components_unittests",
+     "//components/gwp_asan:gwp_asan_unittests",

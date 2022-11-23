@@ -1,0 +1,11 @@
+
+executable("chromium_ll_examples") {
+  sources = [
+    "main.cc"
+  ]
+
+  deps = [
+    "//base",
+    "//net",
+  ]
+}
