@@ -18,6 +18,10 @@
 #include "base/task/thread_pool/thread_pool_instance.h"
 #include "base/test/bind.h"
 #include "base/threading/thread.h"
+#include "chromium_ll_examples/url_loader.mojom.h"
+#include "mojo/core/embedder/embedder.h"
+#include "mojo/public/cpp/bindings/receiver.h"
+#include "mojo/public/cpp/bindings/remote.h"
 #include "net/base/completion_once_callback.h"
 #include "net/base/io_buffer.h"
 #include "net/cookies/cookie_store.h"
@@ -248,6 +252,53 @@ std::unique_ptr<base::Thread> StartIOThread(
   return io_thread;
 }
 
+class URLLoader : public url_loader::mojom::URLLoader {
+ public:
+  explicit URLLoader(
+      mojo::PendingReceiver<url_loader::mojom::URLLoader> receiver);
+  URLLoader(const URLLoader&) = delete;
+  URLLoader& operator=(const URLLoader&) = delete;
+  ~URLLoader() override {}
+
+  void DownloadFromURL(const std::string& url,
+                       DownloadFromURLCallback callback) override;
+
+ private:
+  mojo::Receiver<url_loader::mojom::URLLoader> receiver_;
+  std::unique_ptr<base::Thread::Delegate> delegate_;
+  std::unique_ptr<base::Thread> io_thread_;
+  Request request_;
+  scoped_refptr<base::SequencedTaskRunner> main_task_runner_;
+};
+
+URLLoader::URLLoader(
+    mojo::PendingReceiver<url_loader::mojom::URLLoader> receiver)
+    : receiver_(this, std::move(receiver)),
+      delegate_(std::make_unique<IOThreadDelegate>()),
+      io_thread_(StartIOThread(std::move(delegate_))),
+      main_task_runner_(base::SequencedTaskRunner::GetCurrentDefault()) {
+  // Request execution needs thread pool.
+  base::ThreadPoolInstance::Create("download_thread_pool");
+}
+
+void URLLoader::DownloadFromURL(const std::string& url,
+                                DownloadFromURLCallback callback) {
+  // We must create URL request on task runner bound to io thread.
+  io_thread_->task_runner()->PostTask(
+      FROM_HERE,
+      base::BindOnce(
+          &Request::StartOnIOThread, base::Unretained(&request_), GURL(url),
+          base::BindLambdaForTesting(
+              [callback = std::move(callback), url, this]() mutable {
+                main_task_runner_->PostTask(
+                    FROM_HERE,
+                    base::BindLambdaForTesting(
+                        [callback = std::move(callback), url]() mutable {
+                          std::move(callback).Run("Downloaded " + url);
+                        }));
+              })));
+}
+
 int main(int argc, char* argv[]) {
   logging::SetLogItems(true /* enable_process_id */,
                        true /* enable_thread_id */, true /* enable_timestamp */,
@@ -270,26 +321,24 @@ int main(int argc, char* argv[]) {
     return 2;
   }
 
-  // Things were much more simple when we had MessageLoop. Now we need to set up
-  // Pretty complex environment. But that is better for learning.
-
-  std::unique_ptr<base::Thread::Delegate> delegate =
-      std::make_unique<IOThreadDelegate>();
-  std::unique_ptr<base::Thread> io_thread = StartIOThread(std::move(delegate));
-
-  // Request execution needs thread pool.
-  base::ThreadPoolInstance::Create("download_thread_pool");
+  mojo::core::Init();
 
   base::SingleThreadTaskExecutor task_executor;
   base::RunLoop main_run_loop;
+  base::OnceClosure quit_loop = main_run_loop.QuitClosure();
 
-  Request request;
+  mojo::Remote<url_loader::mojom::URLLoader> remote;
+  mojo::PendingReceiver<url_loader::mojom::URLLoader> receiver =
+      remote.BindNewPipeAndPassReceiver();
 
-  // We must create URL request on task runner bound to io thread.
-  io_thread->task_runner()->PostTask(
-      FROM_HERE,
-      base::BindOnce(&Request::StartOnIOThread, base::Unretained(&request),
-                     gurl, main_run_loop.QuitClosure()));
+  URLLoader url_loader_factory(std::move(receiver));
+
+  remote->DownloadFromURL(
+      url_str, base::BindLambdaForTesting([quit_loop = std::move(quit_loop)](
+                                              const std::string& msg) mutable {
+        DLOG(ERROR) << msg << std::endl;
+        std::move(quit_loop).Run();
+      }));
 
   // Loop in place till download completes.
   main_run_loop.Run();

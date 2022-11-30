@@ -1,3 +1,10 @@
+import("//mojo/public/tools/bindings/mojom.gni")
+
+mojom("mojom") {
+  sources = [
+    "url_loader.mojom",
+  ]
+}
 
 executable("chromium_ll_examples") {
   sources = [
@@ -7,5 +14,8 @@ executable("chromium_ll_examples") {
   deps = [
     "//base",
     "//net",
+    "//mojo/public/cpp/bindings",
+    "//mojo/core/embedder",
+    ":mojom"
   ]
 }
