@@ -9,6 +9,7 @@
 #include "base/memory/scoped_refptr.h"
 #include "base/message_loop/message_pump.h"
 #include "base/message_loop/message_pump_type.h"
+#include "base/process/launch.h"
 #include "base/run_loop.h"
 #include "base/sequence_checker.h"
 #include "base/task/sequence_manager/sequence_manager.h"
@@ -20,8 +21,11 @@
 #include "base/threading/thread.h"
 #include "chromium_ll_examples/url_loader.mojom.h"
 #include "mojo/core/embedder/embedder.h"
+#include "mojo/core/embedder/scoped_ipc_support.h"
 #include "mojo/public/cpp/bindings/receiver.h"
 #include "mojo/public/cpp/bindings/remote.h"
+#include "mojo/public/cpp/platform/platform_channel.h"
+#include "mojo/public/cpp/system/invitation.h"
 #include "net/base/completion_once_callback.h"
 #include "net/base/io_buffer.h"
 #include "net/cookies/cookie_store.h"
@@ -245,7 +249,8 @@ std::unique_ptr<base::Thread> StartIOThread(
 
   base::Thread::Options options;
   options.message_pump_type = base::MessagePumpType::IO;
-  options.delegate = std::move(delegate);
+  if (delegate)
+    options.delegate = std::move(delegate);
   if (!io_thread->StartWithOptions(std::move(options)))
     LOG(FATAL) << "Failed to start Thread:IO";
 
@@ -255,7 +260,8 @@ std::unique_ptr<base::Thread> StartIOThread(
 class URLLoader : public url_loader::mojom::URLLoader {
  public:
   explicit URLLoader(
-      mojo::PendingReceiver<url_loader::mojom::URLLoader> receiver);
+      mojo::PendingReceiver<url_loader::mojom::URLLoader> pending_receiver,
+      scoped_refptr<base::SequencedTaskRunner> io_task_runner);
   URLLoader(const URLLoader&) = delete;
   URLLoader& operator=(const URLLoader&) = delete;
   ~URLLoader() override {}
@@ -266,16 +272,16 @@ class URLLoader : public url_loader::mojom::URLLoader {
  private:
   mojo::Receiver<url_loader::mojom::URLLoader> receiver_;
   std::unique_ptr<base::Thread::Delegate> delegate_;
-  std::unique_ptr<base::Thread> io_thread_;
+  scoped_refptr<base::SequencedTaskRunner> io_task_runner_;
   Request request_;
   scoped_refptr<base::SequencedTaskRunner> main_task_runner_;
 };
 
 URLLoader::URLLoader(
-    mojo::PendingReceiver<url_loader::mojom::URLLoader> receiver)
-    : receiver_(this, std::move(receiver)),
-      delegate_(std::make_unique<IOThreadDelegate>()),
-      io_thread_(StartIOThread(std::move(delegate_))),
+    mojo::PendingReceiver<url_loader::mojom::URLLoader> pending_receiver,
+    scoped_refptr<base::SequencedTaskRunner> io_task_runner)
+    : receiver_(this, std::move(pending_receiver)),
+      io_task_runner_(io_task_runner),
       main_task_runner_(base::SequencedTaskRunner::GetCurrentDefault()) {
   // Request execution needs thread pool.
   base::ThreadPoolInstance::Create("download_thread_pool");
@@ -284,30 +290,25 @@ URLLoader::URLLoader(
 void URLLoader::DownloadFromURL(const std::string& url,
                                 DownloadFromURLCallback callback) {
   // We must create URL request on task runner bound to io thread.
-  io_thread_->task_runner()->PostTask(
+  io_task_runner_->PostTask(
       FROM_HERE,
       base::BindOnce(
           &Request::StartOnIOThread, base::Unretained(&request_), GURL(url),
-          base::BindLambdaForTesting(
-              [callback = std::move(callback), url, this]() mutable {
-                main_task_runner_->PostTask(
-                    FROM_HERE,
-                    base::BindLambdaForTesting(
-                        [callback = std::move(callback), url]() mutable {
-                          std::move(callback).Run("Downloaded " + url);
-                        }));
-              })));
+          base::BindLambdaForTesting([callback = std::move(callback), url,
+                                      this]() mutable {
+            main_task_runner_->PostTask(
+                FROM_HERE, base::BindLambdaForTesting(
+                               [callback = std::move(callback), url]() mutable {
+                                 std::move(callback).Run("Downloaded " + url);
+                               }));
+          })));
 }
 
-int main(int argc, char* argv[]) {
-  logging::SetLogItems(true /* enable_process_id */,
-                       true /* enable_thread_id */, true /* enable_timestamp */,
-                       true /* enable_tickcount */);
-  logging::InitLogging({});
-  base::AtExitManager at_exit_manager;
-  base::CommandLine::Init(argc, argv);
-  base::CommandLine* cmdline = base::CommandLine::ForCurrentProcess();
+uint64_t GetPipeName() {
+  return 138904UL;
+}
 
+int ParentMain(base::CommandLine* cmdline) {
   if (cmdline->GetArgs().size() < 1) {
     LOG(ERROR) << "Argument missing.";
     return 1;
@@ -322,20 +323,41 @@ int main(int argc, char* argv[]) {
   }
 
   mojo::core::Init();
-
+  std::unique_ptr<base::Thread> io_thread =
+      StartIOThread(std::unique_ptr<base::Thread::Delegate>(nullptr));
+  auto ipc_support = std::make_unique<mojo::core::ScopedIPCSupport>(
+      io_thread->task_runner(),
+      mojo::core::ScopedIPCSupport::ShutdownPolicy::CLEAN);
   base::SingleThreadTaskExecutor task_executor;
   base::RunLoop main_run_loop;
   base::OnceClosure quit_loop = main_run_loop.QuitClosure();
 
-  mojo::Remote<url_loader::mojom::URLLoader> remote;
-  mojo::PendingReceiver<url_loader::mojom::URLLoader> receiver =
-      remote.BindNewPipeAndPassReceiver();
+  base::FilePath child_path = cmdline->GetProgram();
+  std::unique_ptr<base::CommandLine> child_cmd_line =
+      std::make_unique<base::CommandLine>(child_path);
+  child_cmd_line->AppendSwitch("child_process");
 
-  URLLoader url_loader_factory(std::move(receiver));
+  uint64_t pipe_name = GetPipeName();
+  mojo::OutgoingInvitation invitation;
+  mojo::ScopedMessagePipeHandle pipe = invitation.AttachMessagePipe(pipe_name);
+  mojo::PendingRemote<url_loader::mojom::URLLoader> pending_remote(
+      std::move(pipe), 0);
+  mojo::Remote<url_loader::mojom::URLLoader> remote;
+  remote.Bind(std::move(pending_remote));
+  mojo::PlatformChannel mojo_channel;
+  base::LaunchOptions options;
+  mojo_channel.PrepareToPassRemoteEndpoint(&options, child_cmd_line.get());
+
+  base::Process process = base::LaunchProcess(*child_cmd_line, options);
+
+  mojo_channel.RemoteProcessLaunchAttempted();
+  mojo::OutgoingInvitation::Send(std::move(invitation), process.Handle(),
+                                 mojo_channel.TakeLocalEndpoint());
 
   remote->DownloadFromURL(
       url_str, base::BindLambdaForTesting([quit_loop = std::move(quit_loop)](
-                                              const std::string& msg) mutable {
+                                              const std::string& msg) mutable
+                                              {
         DLOG(ERROR) << msg << std::endl;
         std::move(quit_loop).Run();
       }));
@@ -343,4 +365,59 @@ int main(int argc, char* argv[]) {
   // Loop in place till download completes.
   main_run_loop.Run();
   return 0;
+}
+
+int ChildMain(base::CommandLine* cmdline) {
+  mojo::core::Init();
+  std::unique_ptr<base::Thread> io_thread =
+      StartIOThread(std::make_unique<IOThreadDelegate>());
+  auto ipc_support = std::make_unique<mojo::core::ScopedIPCSupport>(
+      io_thread->task_runner(),
+      mojo::core::ScopedIPCSupport::ShutdownPolicy::CLEAN);
+  base::SingleThreadTaskExecutor task_executor;
+  base::RunLoop child_run_loop;
+  base::OnceClosure quit_loop = child_run_loop.QuitClosure();
+
+  mojo::PlatformChannelEndpoint mojo_channel_endpoint =
+      mojo::PlatformChannel::RecoverPassedEndpointFromCommandLine(*cmdline);
+
+  if (!mojo_channel_endpoint.is_valid()) {
+    LOG(ERROR) << "Invalid platform channel endpoint in command line.";
+    return 1;
+  }
+
+  mojo::IncomingInvitation invitation =
+      mojo::IncomingInvitation::Accept(std::move(mojo_channel_endpoint));
+
+  mojo::ScopedMessagePipeHandle pipe_handle =
+      invitation.ExtractMessagePipe(GetPipeName());
+
+  if (!pipe_handle.is_valid()) {
+    LOG(ERROR) << "Invalid message pipe in mojo invitation.";
+    return 2;
+  }
+
+  auto pending_receiver = mojo::PendingReceiver<url_loader::mojom::URLLoader>(
+      std::move(pipe_handle));
+
+  URLLoader url_loader(std::move(pending_receiver), io_thread->task_runner());
+
+  child_run_loop.Run();
+  return 0;
+}
+
+int main(int argc, char* argv[]) {
+  logging::SetLogItems(true /* enable_process_id */,
+                       true /* enable_thread_id */, true /* enable_timestamp */,
+                       true /* enable_tickcount */);
+  logging::InitLogging({});
+  base::AtExitManager at_exit_manager;
+  base::CommandLine::Init(argc, argv);
+  base::CommandLine* cmdline = base::CommandLine::ForCurrentProcess();
+
+  if (cmdline->HasSwitch("child_process")) {
+    return ChildMain(cmdline);
+  } else {
+    return ParentMain(cmdline);
+  }
 }
